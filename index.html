@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>4D BMW Driving (Three.js)</title>
+  <style>
+    body { margin:0; overflow:hidden; background:#000; }
+    #hud {
+      position:fixed; top:10px; left:10px; color:#fff; font:14px/1.5 system-ui, Arial;
+      background:rgba(0,0,0,0.45); padding:10px 12px; border-radius:10px; max-width:420px;
+      backdrop-filter: blur(6px);
+    }
+    #hud b { color:#fff; }
+  </style>
+</head>
+<body>
+<div id="hud">
+  <div><b>Controls</b></div>
+  <div>W/S or ↑/↓: Throttle/Brake · A/D or ←/→: Steer · Shift: Boost · Space: Handbrake</div>
+  <div>Q/E: Rotate 4D (z–w) axis · R: Reset</div>
+  <div>Tip: Rotate the 4D axis to reveal hidden bends and phase-shift obstacles.</div>
+</div>
+
+<!-- Three.js core & extras -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.155.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.155.0/examples/js/loaders/RGBELoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.155.0/examples/jsm/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.155.0/examples/jsm/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.155.0/examples/jsm/postprocessing/UnrealBloomPass.js"></script>
+
+<script>
+// ===========================
+// Renderer, scene, camera
+// ===========================
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 2000);
+camera.position.set(0, 6, 14);
+
+// Resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ===========================
+// Environment (HDRI) and lighting
+// ===========================
+const pmrem = new THREE.PMREMGenerator(renderer);
+new THREE.RGBELoader()
+  .setDataType(THREE.UnsignedByteType)
+  .load('ASSETS/env/modern_plaza_1k.hdr', (hdr) => {
+    const envMap = pmrem.fromEquirectangular(hdr).texture;
+    scene.environment = envMap;
+    hdr.dispose(); pmrem.dispose();
+  });
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a24, 0.55);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight(0xfff6e5, 1.0);
+sun.position.set(30, 50, 10);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -100; sun.shadow.camera.right = 100;
+sun.shadow.camera.top = 100; sun.shadow.camera.bottom = -100;
+scene.add(sun);
+
+// ===========================
+// Postprocessing (bloom)
+// ===========================
+const composer = new THREE.EffectComposer(renderer);
+const renderPass = new THREE.RenderPass(scene, camera);
+const bloomPass = new THREE.UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.6, 0.8, 0.2);
+composer.addPass(renderPass);
+composer.addPass(bloomPass);
+
+// ===========================
+// 4D projection helpers
+// ===========================
+let wAngle = 0.0; // rotation between z and w
+function projectZW(z, w, angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return z * c + w * s; // return projected z'
+}
+function project4(x, y, z, w, angle) {
+  return new THREE.Vector3(x, y, projectZW(z, w, angle));
+}
+
+// ===========================
+// Road: detailed textured surface with lane marks and curbs
+// ===========================
+const roadGroup = new THREE.Group();
+scene.add(roadGroup);
+
+const texLoader = new THREE.TextureLoader();
+const asphaltColor = texLoader.load('ASSETS/textures/road/asphalt_color.jpg');
+const asphaltNormal = texLoader.load('ASSETS/textures/road/asphalt_normal.jpg');
+const asphaltRough = texLoader.load('ASSETS/textures/road/asphalt_rough.jpg');
+[asphaltColor, asphaltNormal, asphaltRough].forEach(t => { t.wrapS = t.wrapT = THREE.RepeatWrapping; });
+
+const roadMat = new THREE.MeshStandardMaterial({
+  map: asphaltColor,
+  normalMap: asphaltNormal,
+  roughnessMap: asphaltRough,
+  roughness: 0.95,
+  metalness: 0.0
+});
+
+const laneMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  emissive: new THREE.Color(0x202020),
+  emissiveIntensity: 0.6,
+  roughness: 0.8
+});
+
+const curbMat = new THREE.MeshStandardMaterial({ color: 0xb5b5b5, roughness: 0.9, metalness: 0.05 });
+
+function addRoadSegment(x, z, w, length=24, width=10, yaw=0) {
+  const p = project4(x, 0, z, w, wAngle);
+
+  // Road slab
+  const geo = new THREE.BoxGeometry(width, 0.2, length);
+  asphaltColor.repeat.set(length/8, width/8);
+  asphaltNormal.repeat.set(length/8, width/8);
+  asphaltRough.repeat.set(length/8, width/8);
+
+  const road = new THREE.Mesh(geo, roadMat);
+  road.position.set(p.x, 0, p.z);
+  road.rotation.y = yaw;
+  road.castShadow = false; road.receiveShadow = true;
+  roadGroup.add(road);
+
+  // Center lane mark
+  const lane = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.22, length), laneMat);
+  lane.position.set(p.x, 0.02, p.z);
+  lane.rotation.y = yaw;
+  lane.castShadow = false; lane.receiveShadow = true;
+  roadGroup.add(lane);
+
+  // Curbs
+  const curbL = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.4, length), curbMat);
+  const curbR = curbL.clone();
+  curbL.position.set(p.x + width/2 + 0.25, 0.1, p.z);
+  curbR.position.set(p.x - width/2 - 0.25, 0.1, p.z);
+  curbL.rotation.y = yaw; curbR.rotation.y = yaw;
+  curbL.castShadow = true; curbR.castShadow = true;
+  curbL.receiveShadow = true; curbR.receiveShadow = true;
+  roadGroup.add(curbL, curbR);
+
+  return { road, lane, curbL, curbR, x, z, w, yaw };
+}
+
+// Build track with 4D warps (hidden bends via w)
+const segments = [];
+let sx=0, sz=0, sw=0;
+for (let i=0; i<24; i++) {
+  const yaw = (i<8) ? 0 : (i<16 ? Math.PI/10 : -Math.PI/7);
+  sw = Math.sin(i * 0.35) * 12; // 4D offset
+  segments.push(addRoadSegment(sx, sz, sw, 26, 12, yaw));
+  sz += 20 * Math.cos(yaw);
+  sx += 20 * Math.sin(yaw);
+}
+
+// ===========================
+// Trees: simple performant instanced pines with bark/leaves
+// ===========================
+const treeGroup = new THREE.Group();
+scene.add(treeGroup);
+
+// Bark & leaf materials
+const barkMat = new THREE.MeshStandardMaterial({ color: 0x6b4f3f, roughness: 0.95, metalness: 0.05 });
+const leafMat = new THREE.MeshStandardMaterial({
+  color: 0x2e7d32,
+  emissive: 0x06240a,
+  emissiveIntensity: 0.25,
+  roughness: 0.8
+});
+
+function makeTree(x, z, w, h=6, r=0.4) {
+  const p = project4(x, 0, z, w, wAngle);
+
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 12), barkMat);
+  trunk.position.set(p.x, h/2, p.z);
+  trunk.castShadow = true; trunk.receiveShadow = true;
+
+  const crown = new THREE.Mesh(new THREE.ConeGeometry(h*0.7, h*0.9, 16), leafMat);
+  crown.position.set(p.x, h*0.95, p.z);
+  crown.castShadow = true; crown.receiveShadow = true;
+
+  treeGroup.add(trunk, crown);
+}
+
+for (let i=0; i<50; i++) {
+  const side = (i%2===0) ? 1 : -1;
+  const ox = (12 + Math.random()*18) * side;
+  const oz = 30 + i*16 + Math.random()*10;
+  const ow = Math.cos(i*0.3) * 10;
+  makeTree(ox, oz, ow, 5 + Math.random()*4, 0.35 + Math.random()*0.2);
+}
+
+// ===========================
+// Obstacles that phase with w
+// ===========================
+const obstacleMat = new THREE.MeshStandardMaterial({ color: 0x7f00ff, emissive: 0x250044, emissiveIntensity: 0.6 });
+const obstacleGroup = new THREE.Group(); scene.add(obstacleGroup);
+const obstacles = [];
+for (let i=0; i<18; i++) {
+  const ox = (Math.random()-0.5)*28;
+  const oz = 40 + i*18;
+  const ow = Math.cos(i*0.6) * 14;
+  const p = project4(ox, 0.7, oz, ow, wAngle);
+  const m = new THREE.Mesh(new THREE.TorusKnotGeometry(0.7, 0.25, 64, 8), obstacleMat);
+  m.position.set(p.x, p.y, p.z);
+  m.castShadow = true; m.receiveShadow = true;
+  obstacleGroup.add(m);
+  obstacles.push({ ox, oz, ow, mesh:m });
+}
+
+// ===========================
+// BMW Car (glTF)
+// ===========================
+const car = new THREE.Group(); scene.add(car);
+let carModel;
+new THREE.GLTFLoader().load(
+  'ASSETS/models/bmw_m4/scene.gltf', // Replace with your BMW GLTF/GLB path
+  (gltf) => {
+    carModel = gltf.scene;
+    carModel.scale.set(0.9, 0.9, 0.9);
+    carModel.traverse((obj) => {
+      if (obj.isMesh) {
+        obj.castShadow = true; obj.receiveShadow = true;
+        if (obj.material && obj.material.map) obj.material.map.anisotropy = 8;
+        if (obj.material && obj.material.normalMap) obj.material.normalMap.anisotropy = 8;
+        // Subtle clearcoat if using MeshPhysicalMaterial
+        if (obj.material && 'clearcoat' in obj.material) {
+          obj.material.clearcoat = 0.3;
+          obj.material.clearcoatRoughness = 0.2;
+        }
+      }
+    });
+    car.add(carModel);
+  }
+);
+
+// Simple collider box to approximate the car dimensions
+const carCollider = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.7, 3.6), new THREE.MeshBasicMaterial({ visible:false }));
+car.add(carCollider);
+
+// Car dynamics
+let carPos = new THREE.Vector3(0, 0.35, -10);
+let speed = 0;
+let heading = 0;
+let boost = 0;
+
+// Wheels spin proxy (optional: find wheel meshes by name if in model)
+const wheelSpinNodes = [];
+
+// ===========================
+// Input
+// ===========================
+const keys = {};
+window.addEventListener('keydown', (e) => { keys[e.code]=true; if (e.code==='KeyR') reset(); });
+window.addEventListener('keyup', (e) => { keys[e.code]=false; });
+
+function reset() {
+  speed = 0; heading = 0; wAngle = 0; boost = 0;
+  carPos.set(0, 0.35, -10);
+}
+
+// ===========================
+// Update 4D projection for world objects
+// ===========================
+function updateWorldProjection() {
+  // Road segments
+  segments.forEach(s => {
+    const p = project4(s.x, 0, s.z, s.w, wAngle);
+    s.road.position.set(p.x, 0, p.z);
+    s.lane.position.set(p.x, 0.02, p.z);
+    s.curbL.position.set(p.x + 12/2 + 0.25, 0.1, p.z);
+    s.curbR.position.set(p.x - 12/2 - 0.25, 0.1, p.z);
+    s.road.rotation.y = s.yaw;
+    s.lane.rotation.y = s.yaw;
+    s.curbL.rotation.y = s.yaw;
+    s.curbR.rotation.y = s.yaw;
+  });
+  // Trees
+  treeGroup.children.forEach((obj, i) => {
+    // Recompute from stored x/z/w? For simplicity we nudge position by w-angle shimmer
+    obj.position.z += Math.sin(wAngle + i*0.01) * 0.0; // small no-op; trees are static to keep perf
+  });
+  // Obstacles with visibility fade
+  for (let o of obstacles) {
+    const p = project4(o.ox, 0.7, o.oz, o.ow, wAngle);
+    o.mesh.position.set(p.x, p.y, p.z);
+    const wProjected = o.oz * Math.sin(wAngle) + o.ow * Math.cos(wAngle);
+    const opacity = THREE.MathUtils.clamp(1.0 - Math.abs(wProjected) / 24, 0.2, 1.0);
+    o.mesh.material.opacity = opacity;
+    o.mesh.material.transparent = true;
+    o.mesh.material.emissiveIntensity = 0.3 + (1.0 - opacity) * 0.9;
+  }
+}
+
+// ===========================
+// Game loop
+// ===========================
+let last = performance.now();
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.033, (now - last)/1000); last = now;
+
+  // Input
+  const throttle = (keys['KeyW']||keys['ArrowUp']) ? 1 : 0;
+  const brake    = (keys['KeyS']||keys['ArrowDown']) ? 1 : 0;
+  const steerL   = (keys['KeyA']||keys['ArrowLeft']) ? 1 : 0;
+  const steerR   = (keys['KeyD']||keys['ArrowRight']) ? 1 : 0;
+  const handbrake = keys['Space'] ? 1 : 0;
+  const boosting  = (keys['ShiftLeft']||keys['ShiftRight']) ? 1 : 0;
+  const rotNeg = keys['KeyQ'] ? 1 : 0;
+  const rotPos = keys['KeyE'] ? 1 : 0;
+
+  // 4D rotation
+  wAngle += (rotPos - rotNeg) * dt * 0.8;
+  updateWorldProjection();
+
+  // Speed model
+  const accel = throttle * 16 + boosting * 12 - brake * 20 - handbrake * 28;
+  const drag  = 6 + Math.abs(speed) * 0.7;
+  speed += (accel - drag * Math.sign(speed)) * dt;
+  speed = THREE.MathUtils.clamp(speed, -12, 42);
+  boost = THREE.MathUtils.lerp(boost, boosting ? 1 : 0, dt*3);
+
+  // Steering (stronger at low speed)
+  const steer = (steerR - steerL) * dt * (1.9 - Math.min(Math.abs(speed)/28, 1.3));
+  heading += steer;
+
+  // Movement
+  const forward = new THREE.Vector3(Math.sin(heading), 0, -Math.cos(heading));
+  carPos.addScaledVector(forward, speed * dt);
+  carPos.y = 0.35;
+
+  // Car transform
+  car.position.copy(carPos);
+  car.rotation.y = heading;
+
+  // Camera spring follow
+  const camTarget = carPos.clone().add(new THREE.Vector3(0, 6.5 + boost*1.6, 12));
+  camera.position.lerp(camTarget, dt*3.2);
+  const lookAt = carPos.clone().add(forward.clone().multiplyScalar(8));
+  camera.lookAt(lookAt);
+
+  // Simple collision: obstacles
+  for (let o of obstacles) {
+    const d = o.mesh.position.distanceTo(carPos);
+    if (d < 1.8) {
+      speed *= -0.3;
+    }
+  }
+
+  // Sun color shift for mood
+  const tint = (Math.sin(wAngle*1.1)+1)/2;
+  sun.color.setHSL(0.12 + 0.1*tint, 0.6, 0.85);
+
+  composer.render();
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
